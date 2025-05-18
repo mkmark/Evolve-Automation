@@ -2900,6 +2900,8 @@
         [buildings.SpirePort, buildings.SpireBaseCamp],
     ]
 
+    var assemblyBuildings = [buildings.Assembly, buildings.RedAssembly, buildings.TauAssembly];
+
     var projects = {
         LaunchFacility: new Project("Launch Facility", "launch_facility"),
         SuperCollider: new Project("Supercollider", "lhc"),
@@ -3414,6 +3416,16 @@
           (building) => (building._tab === "city" || building._tab === "space" || building._tab === "starDock") && !(building instanceof ResourceAction),
           () => "Solar System building",
           () => settings.buildingWeightingSolar
+      ],[
+          () => settings.buildingSpecialAssembly && game.global.race['artifical'],
+          (building) => (assemblyBuildings.includes(building)),
+          () => "Using special multi-build mode",
+          () => 1 // Pop assembly is crucial to progress, let normal weightings work too in case resources are short
+      ],[
+          () => settings.buildingSpecialSwarmSat && (buildings.SunSwarmSatellite.cost.Money??0) <= settings.buildingSpecialSwarmSatMoneyCap,
+          (building) => building === buildings.SunSwarmSatellite,
+          () => "Using special multi-build mode",
+          () => 0
     ]];
 
     // Singleton manager objects
@@ -5073,7 +5085,7 @@
                 // Calculate number of soldiers needed for Soul Forge
                 let base = game.global.race['warlord'] ? 400 : 650;
              let soulForgeSoldiers = Math.round(base / soldierRating);
-        
+
                 // Adjust for gun emplacements
                 if (buildings.PitGunEmplacement.count > 0) {
                     soulForgeSoldiers -= Math.floor(buildings.PitGunEmplacement.stateOnCount * 1.5);
@@ -7661,7 +7673,10 @@
             buildingsBestFreighter: false,
             buildingsUseMultiClick: false,
             buildingEnabledAll: true,
-            buildingStateAll: true
+            buildingStateAll: true,
+            buildingSpecialAssembly: true,
+            buildingSpecialSwarmSat: true,
+            buildingSpecialSwarmSatMoneyCap: 100,
         }
 
         for (let i = 0; i < BuildingManager.priorityList.length; i++) {
@@ -11200,6 +11215,11 @@
         for (let i = 0; i < buildingList.length; i++) {
             let building = buildingList[i];
 
+
+            if (settings.buildingSpecialSwarmSat && building === buildings.SunSwarmSatellite) {
+                continue;
+            }
+
             // Only go further if it's affordable building, and not current target
             if (ignoredList.includes(building) || !isAffordable(building)) {
                 continue;
@@ -11322,6 +11342,82 @@
             }
         }
     }
+
+    function autoBuildSpecial() {
+        // "Special" builders with non-standard logic go here. Special builders disregard weightings and ignore trigger resources on purpose.
+        // Each has its own setting, and will also respect each buildings autoBuild toggle.
+
+        // Script forces NaNs in max quantity to be MAX_SAFE_INTEGER.
+        // NaNs everywhere else can manifest as NaN or Infinity, isFinite checks both.
+        // We need to double-check data from the game to avoid infinite/very long loops, as there can be bugs causing brief ticks of invalid data.
+        const isRealisticNumber = (num) => Number.isFinite(num) && num <= (Number.MAX_SAFE_INTEGER - 1);
+
+        // Special multi-build for population assembly buildings
+        const autoBuildSpecialPopulation = () => {
+            if (settings.buildingSpecialAssembly && game.global.race['artifical'] && resources.Population.storageRatio < 1) {
+                if (!isRealisticNumber(resources.Population.currentQuantity) || !isRealisticNumber(resources.Population.maxQuantity)) {
+                    return;
+                }
+
+                let building = haveTech("focus_cure", 7) ? buildings.TauCloning : assemblyBuildings.find(b => b.isUnlocked());
+                if (building && building.autoBuildEnabled) {
+                    // Limit to building 100 population per tick. Arbitrary number but there should be no situations where this matters.
+                    let targetCount = Math.min(resources.Population.maxQuantity, building.autoMax, resources.Population.currentQuantity + 100);
+
+                    // Never multi-build in Fasting or Gravity Well to reduce Meditator/Teamster fluctuation impact
+                    if (game.global.race['fasting'] || game.global.race['gravity_well']) {
+                        targetCount = Math.min(resources.Population.currentQuantity + 1, targetCount);
+                    }
+
+                    if (!isRealisticNumber(targetCount)) return;
+
+                    for (let i = resources.Population.currentQuantity; i < targetCount; ++i) {
+                        if (!building.click(true)) break;
+                        building.updateResourceRequirements();
+                    }
+                }
+            }
+        };
+
+        // Special multi-build for swarm sats
+        const autoBuildSpecialSwarmSat = () => {
+            if (settings.buildingSpecialSwarmSat && buildings.SunSwarmSatellite.isUnlocked() && buildings.SunSwarmSatellite.autoBuildEnabled) {
+                let building = buildings.SunSwarmSatellite;
+                let maxCost = settings.buildingSpecialSwarmSatMoneyCap;
+
+                // Some overbuilding is good in case of sudden quantum drop, but too much overbuilding can cause lag (eg in micro when able to build 20k+ of them).
+                // To avoid lag and excess spending, limit overbuilding to 1000 above support and only do it when free.
+                if (buildings.SunSwarmSatellite.count >= resources.Sun_Support.maxQuantity) {
+                    maxCost = 0;
+                }
+                let maxCount = (maxCost > 0 ? 0 : 1000) + (resources.Sun_Support.maxQuantity - building.count);
+
+                if (!isRealisticNumber(maxCount)) {
+                    return;
+                }
+
+                // The game's cost calculation logic isn't optimized for very high numbers and can get really slow.
+                // Limit building to 1000 per tick by default, but to avoid the browser considering the tab frozen,
+                // limit to 100/tick once we get into micro-only territory.
+                maxCount = Math.min(buildings.SunSwarmSatellite.count >= 10000 ? 100 : 1000, maxCount);
+
+                for (let i = 0; i < maxCount; ++i) {
+                    if ((building.cost.Money ?? 0) > maxCost || !building.click(true)) {
+                        break;
+                    }
+                    building.updateResourceRequirements();
+                }
+
+                if (building.boughtThisTick && !logIgnore.includes(building.id)) {
+                    GameLog.logSuccess("multi_construction", poly.loc('build_success', [`${building.title} (${building.boughtThisTick})`]), ['queue', 'building_queue']);
+                }
+            }
+        };
+
+        autoBuildSpecialPopulation();
+        autoBuildSpecialSwarmSat();
+    }
+
 
     function getTechConflict(tech) {
         let itemId = tech._vueBinding;
@@ -14193,6 +14289,7 @@
             }
             if (settings.autoBuild || settings.autoARPA) {
                 autoBuild(); // Called after autoStorage to compensate fluctuations of quantum(caused by previous tick's adjustments) levels before weightings
+                autoBuildSpecial();
             }
         }
         if (settings.autoFactory) {
@@ -18294,6 +18391,10 @@
         addSettingsToggle(currentNode, "buildingsTransportGem", "Build cheapest Supplies transport", "By default script chooses between Lake Transport and Lake Bireme Warship comparing their 'Supplies Per Support', with this option enabled it will compare 'Supplies Per Soulgems' instead.");
         addSettingsToggle(currentNode, "buildingsBestFreighter", "Build most efficient freighters", "With this option enabled script will compare 'Money Storage per Crew' of Freighter and Super Freighter, and only build the best one. Without this option no restrictions will be applied. Works only when both ships are buildable.");
         addSettingsToggle(currentNode, "buildingsUseMultiClick", "Bulk build multi-segmented buildings", "With this option enabled, the script will build as many segments as are affordable at once, instead of one per tick.");
+        addSettingsToggle(currentNode, "buildingSpecialAssembly", "Smart population assembly", "For population assembly: Disables the default autoBuild weighting system, allows multi-build and treats assembly as absolute priority. Build limit and build toggle will still be respected. Multi-build disabled in Gravity Well and Fasting, but will still ignore weighting.");
+        addSettingsToggle(currentNode, "buildingSpecialSwarmSat", "Smart Swarm Satellite construction", "For Swarm Satellites: While below the money cap, disables the default autoBuild weighting system, allows multi-build up to your current support cap. Overbuilds up to 1000 satellites if they are free. Autobuild toggle is still respected.");
+        addSettingsNumber(currentNode, "buildingSpecialSwarmSatMoneyCap", "Smart Swarm Satellite money cap", "For Swarm Satellites: Disables smart buying as soon as the next satellite's money cost exceeds this amount. Regular build behavior will be active while above this money cost. No effect if Smart Swarm Satellites is disabled.");
+
         addSettingsNumber(currentNode, "buildingTowerSuppression", "Minimum suppression for Towers", "East Tower and West Tower won't be built until minimum suppression is reached");
 
         const consumptionOptions = [
